@@ -46,35 +46,122 @@ local function keysOf(t, max)
     return table.concat(out, ", ") .. (n > max and (" ...+" .. (n - max)) or "")
 end
 
--- Data dasar dari memori game: World (fg, bg, w, h, spawn) & data item (tabel berisi { name, id, kind, ... })
-local World, ItemDB, nItems, nItemTabs = nil, {}, 0, 0
-local gc, gcErr = nil, nil
+-- Di sebagian executor (mis. Delta) getgc hampir kosong dan fungsi baca konstanta bernama lain.
+local getconsts = (debug and debug.getconstants) or getconstants or getconsts
+
+local function isMine(fn)
+    if isexecutorclosure then
+        local ok, res = pcall(isexecutorclosure, fn)
+        if ok and res then return true end
+    end
+    return false
+end
+
+-- Data dasar: World (punya fg & bg) & data item (tabel berisi { name, id, kind, ... }).
+-- Dicari dengan MENELUSURI isi tabel & upvalue fungsi game, mulai dari fungsi loop game (RenderStepped dll),
+-- handler remote world, getgc (kalau ada isinya) dan modul yang sudah dimuat. Sama seperti cara SkyP di executor ini.
+-- gc = daftar semua tabel & fungsi yang terjangkau (dipakai scan pohon & animasi).
+local World, WW, WH, ItemDB, nItems, nItemTabs = nil, 0, 0, {}, 0, 0
+local gc, gcErr, baseInfo = nil, nil, ""
 local function findBase()
-    if not getgc then
-        gcErr = "getgc tidak ada di executor ini: scan memori tidak bisa jalan"
-        return
+    local seen, queue = {}, {}
+    seen[seen], seen[queue], seen[ItemDB] = true, true, true
+    local function push(x)
+        if not seen[x] then
+            seen[x] = true
+            queue[#queue + 1] = x
+        end
     end
-    local okG, list = pcall(getgc, true)
-    if not okG or type(list) ~= "table" then
-        gcErr = "getgc(true) GAGAL: " .. tostring(list)
-        return
-    end
-    gc = list
-    for i, v in ipairs(gc) do
-        if i % 3000 == 0 then task.wait() end
-        if type(v) == "table" and not rawequal(v, ItemDB) and not rawequal(v, gc) then
-            pcall(function()
-                if not World and type(rawget(v, "fg")) == "table" and type(rawget(v, "bg")) == "table"
-                    and type(rawget(v, "w")) == "number" and type(rawget(v, "h")) == "number" and rawget(v, "spawn") ~= nil then
-                    World = v
-                    return
+    local nLoop, nRemote, nGc, nMod = 0, 0, 0, 0
+    if getconnections then
+        for _, name in ipairs({ "RenderStepped", "Heartbeat", "Stepped", "PreRender", "PreSimulation", "PostSimulation" }) do
+            local okS, sig = pcall(function() return RunService[name] end)
+            if okS and sig then
+                local ok, conns = pcall(getconnections, sig)
+                if ok and type(conns) == "table" then
+                    for _, c in ipairs(conns) do
+                        local okf, fn = pcall(function() return c.Function end)
+                        if okf and type(fn) == "function" and not isMine(fn) then
+                            nLoop = nLoop + 1
+                            push(fn)
+                        end
+                    end
                 end
+            end
+        end
+        pcall(function()
+            for _, ev in ipairs(WorldRemotes:GetChildren()) do
+                if ev:IsA("RemoteEvent") then
+                    local ok, conns = pcall(getconnections, ev.OnClientEvent)
+                    if ok and type(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            local okf, fn = pcall(function() return c.Function end)
+                            if okf and type(fn) == "function" and not isMine(fn) then
+                                nRemote = nRemote + 1
+                                push(fn)
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    if getgc then
+        local okG, list = pcall(getgc, true)
+        if okG and type(list) == "table" then
+            seen[list] = true
+            for _, v in ipairs(list) do
+                local tv = type(v)
+                if tv == "table" or (tv == "function" and not isMine(v)) then
+                    nGc = nGc + 1
+                    push(v)
+                end
+            end
+        end
+    end
+    if getloadedmodules then
+        pcall(function()
+            for _, m in ipairs(getloadedmodules()) do
+                local ok, v = pcall(require, m)
+                if ok and (type(v) == "table" or type(v) == "function") then
+                    nMod = nMod + 1
+                    push(v)
+                end
+            end
+        end)
+    end
+    if #queue == 0 then
+        gcErr = "Tidak ada titik awal penelusuran (getconnections / getgc / getloadedmodules tidak ada atau kosong)"
+        return
+    end
+    local qi, nodes = 1, 0
+    while qi <= #queue and nodes < 150000 do
+        local x = queue[qi]
+        qi = qi + 1
+        nodes = nodes + 1
+        if nodes % 1500 == 0 then task.wait() end
+        if type(x) == "function" then
+            if not (iscclosure and iscclosure(x)) and not isMine(x) then
+                local ups = {}
+                pcall(function() ups = getUpvalues(x) end)
+                for _, u in pairs(ups) do
+                    local tu = type(u)
+                    if tu == "table" or tu == "function" then push(u) end
+                end
+            end
+        else
+            pcall(function()
+                local fg, bg = rawget(x, "fg"), rawget(x, "bg")
+                local isWorld = type(fg) == "table" and type(bg) == "table"
+                    and (type(rawget(x, "call")) == "function" or type(rawget(x, "dropList")) == "function"
+                        or (type(rawget(x, "w")) == "number" and rawget(x, "spawn") ~= nil))
+                if isWorld and not World then World = x end
                 -- tabel item: isi pertamanya { name = teks, ... }; id dari field id atau dari kuncinya
-                local k1, a = next(v)
-                if type(a) == "table" and type(rawget(a, "name")) == "string"
+                local k1, a = next(x)
+                if not isWorld and type(a) == "table" and type(rawget(a, "name")) == "string"
                     and (type(rawget(a, "id")) == "number" or type(k1) == "number") then
                     local added = 0
-                    for k, it in next, v do
+                    for k, it in next, x do
                         if type(it) == "table" and type(rawget(it, "name")) == "string" then
                             local id = rawget(it, "id")
                             if type(id) ~= "number" then id = (type(k) == "number") and k or nil end
@@ -88,9 +175,40 @@ local function findBase()
                         nItemTabs = nItemTabs + 1
                         nItems = nItems + added
                     end
+                    return -- isi tabel item tidak ditelusuri
+                end
+                local n = 0
+                for k, v in next, x do
+                    n = n + 1
+                    if n > 600 then break end
+                    local tv = type(v)
+                    if (tv == "table" or tv == "function") and not (isWorld and (k == "fg" or k == "bg")) then push(v) end
                 end
             end)
         end
+    end
+    gc = queue
+    baseInfo = ("akar: loop=%d remote=%d getgc=%d modul=%d | ditelusuri %d dari %d%s"):format(
+        nLoop, nRemote, nGc, nMod, nodes, #queue, qi <= #queue and " (BATAS tercapai)" or "")
+    -- ukuran world: pakai w & h kalau ada, kalau tidak dihitung dari grid tile
+    if World then
+        pcall(function()
+            local w, h = rawget(World, "w"), rawget(World, "h")
+            if type(w) == "number" and type(h) == "number" then
+                WW, WH = w, h
+                return
+            end
+            local mx, my = -1, -1
+            for y, row in next, rawget(World, "fg") do
+                if type(y) == "number" and type(row) == "table" then
+                    if y > my then my = y end
+                    for x in next, row do
+                        if type(x) == "number" and x > mx then mx = x end
+                    end
+                end
+            end
+            WW, WH = mx + 1, my + 1
+        end)
     end
 end
 
@@ -170,13 +288,14 @@ local function debugTA()
         if okE then exName = tostring(n) .. (v and (" " .. tostring(v)) or "") end
     end
     add("Executor : " .. exName .. " | PlaceVersion " .. tostring(game.PlaceVersion))
-    add(("Fungsi   : getgc=%s getconsts=%s getconnections=%s getupvalues=%s getupvalue=%s setupvalue=%s islclosure=%s isexecutorclosure=%s"):format(
+    add(("Fungsi   : getgc=%s getconstants=%s getconnections=%s getupvalues=%s getupvalue=%s setupvalue=%s islclosure=%s isexecutorclosure=%s"):format(
         tostring(getgc ~= nil), tostring(getconsts ~= nil), tostring(getconnections ~= nil),
         tostring(debug ~= nil and debug.getupvalues ~= nil),
         tostring((debug ~= nil and debug.getupvalue ~= nil) or getupvalue ~= nil),
         tostring((debug ~= nil and debug.setupvalue ~= nil) or setupvalue ~= nil),
         tostring(islclosure ~= nil), tostring(isexecutorclosure ~= nil)))
     add(("Data dasar: World=%s | ItemDB=%d item dari %d tabel"):format(w and "ketemu" or "TIDAK", nItems, nItemTabs))
+    add("Penelusuran: " .. tostring(baseInfo))
     add("Waktu server: " .. tostring(math.floor(st)))
 
     ---------------- POHON ----------------
@@ -186,22 +305,20 @@ local function debugTA()
     if not w then
         add("World belum ketemu di memori. Masuk ke world dulu, lalu jalankan lagi")
     else
-        add(("World %sx%s"):format(tostring(w.w), tostring(w.h)))
+        add(("World %sx%s (w=%s h=%s di tabel World)"):format(tostring(WW), tostring(WH), type(rawget(w, "w")), type(rawget(w, "h"))))
         -- pohon yang ada di world sekarang (tile fg berisi seed)
         pcall(function()
-            for y = 0, w.h - 1 do
-                local row = w.fg[y]
-                if row then
-                    for x = 0, w.w - 1 do
-                        local id = row[x] or 0
-                        if id ~= 0 then
+            for y, row in next, rawget(w, "fg") do
+                if type(y) == "number" and type(row) == "table" then
+                    for x, id in next, row do
+                        if type(x) == "number" and type(id) == "number" and id ~= 0 then
                             local it = ItemDB[id]
                             local byKind = it ~= nil and it.kind == "seed"
                             local byName = it ~= nil and type(it.name) == "string" and string.find(string.lower(it.name), "seed") ~= nil
                             if byKind then nSeed = nSeed + 1 end
                             if byName and not byKind then nSeedName = nSeedName + 1 end
                             if (byKind or byName) and #samples < 3 then
-                                samples[#samples + 1] = { x = x, y = y, idx = y * w.w + x, id = id }
+                                samples[#samples + 1] = { x = x, y = y, idx = y * WW + x, id = id }
                             end
                         end
                     end
@@ -310,7 +427,7 @@ local function debugTA()
     local nTab, nFn = 0, 0
     add("")
     if not gc then
-        add(tostring(gcErr or "scan memori tidak jalan"))
+        add(tostring(gcErr or "penelusuran tidak jalan"))
     else
         local need = math.min(2, #samples)
         local fg, bg = w and rawget(w, "fg"), w and rawget(w, "bg")
@@ -386,7 +503,7 @@ local function debugTA()
                 end
             end
         end
-        add(("Scan memori: %d objek (%d tabel, %d fungsi)"):format(#gc, nTab, nFn))
+        add(("Scan: %d objek terjangkau (%d tabel, %d fungsi)"):format(#gc, nTab, nFn))
     end
 
     add("Tabel yang berisi data di posisi pohon contoh: " .. #treeCands)
@@ -440,7 +557,8 @@ local function debugTA()
         add(("      upvalue %d (terakhir terisi %d) | bind=%s | %s"):format(nUp, lastI, tostring(bindIdx), table.concat(parts, " ")))
     end
     if nArm == 0 then
-        add("  ! Tidak ada fungsi yang cocok: nama di kode game berubah, atau getconsts tidak bisa membaca fungsi game")
+        add(getconsts and "  ! Tidak ada fungsi yang cocok: nama di kode game berubah, atau fungsinya tidak terjangkau penelusuran"
+            or "  ! Executor tidak punya debug.getconstants / getconstants: fungsi tangan tidak bisa dikenali")
     end
 
     -- jalur dari loop game (RenderStepped dll) ke fungsi tangan (pencari SkyP hanya melihat kedalaman 1)
