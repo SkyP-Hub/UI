@@ -1,0 +1,507 @@
+-- SkyP Debug: Pohon & Animasi (file terpisah, tidak butuh script utama / key)
+-- Cara pakai: masuk world, tanam minimal 2 seed, lalu jalankan file ini di executor.
+-- Hasil: disalin ke clipboard + disimpan ke SkyP_debug.txt (folder workspace executor) + dicetak di console.
+-- Hanya MEMBACA data game, tidak mengubah apa pun.
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local WorldRemotes = ReplicatedStorage:FindFirstChild("WorldRemotes") or Instance.new("Folder")
+
+local function say(text)
+    print("[SkyP Debug] " .. text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", { Title = "SkyP Debug", Text = text, Duration = 8 })
+    end)
+end
+
+local function getUpvalues(fn)
+    if debug and debug.getupvalues then
+        local ok, ups = pcall(debug.getupvalues, fn)
+        if ok and type(ups) == "table" then return ups end
+    end
+    local out = {}
+    local gu = (debug and debug.getupvalue) or getupvalue
+    if gu then
+        for i = 1, 60 do
+            local ok, v = pcall(gu, fn, i)
+            if not ok then break end
+            out[i] = v
+        end
+    end
+    return out
+end
+
+local function keysOf(t, max)
+    local out, n = {}, 0
+    pcall(function()
+        for k, v in next, t do
+            n = n + 1
+            if n <= max then
+                local tv = type(v)
+                local extra = (tv == "number" or tv == "boolean") and ("=" .. tostring(v)) or ""
+                out[#out + 1] = tostring(k) .. ":" .. tv .. extra
+            end
+        end
+    end)
+    return table.concat(out, ", ") .. (n > max and (" ...+" .. (n - max)) or "")
+end
+
+-- Data dasar dari memori game: World (fg, bg, w, h, spawn) & data item (tabel berisi { name, id, kind, ... })
+local World, ItemDB, nItems, nItemTabs = nil, {}, 0, 0
+local gc, gcErr = nil, nil
+local function findBase()
+    if not getgc then
+        gcErr = "getgc tidak ada di executor ini: scan memori tidak bisa jalan"
+        return
+    end
+    local okG, list = pcall(getgc, true)
+    if not okG or type(list) ~= "table" then
+        gcErr = "getgc(true) GAGAL: " .. tostring(list)
+        return
+    end
+    gc = list
+    for i, v in ipairs(gc) do
+        if i % 3000 == 0 then task.wait() end
+        if type(v) == "table" and not rawequal(v, ItemDB) and not rawequal(v, gc) then
+            pcall(function()
+                if not World and type(rawget(v, "fg")) == "table" and type(rawget(v, "bg")) == "table"
+                    and type(rawget(v, "w")) == "number" and type(rawget(v, "h")) == "number" and rawget(v, "spawn") ~= nil then
+                    World = v
+                    return
+                end
+                -- tabel item: isi pertamanya { name = teks, ... }; id dari field id atau dari kuncinya
+                local k1, a = next(v)
+                if type(a) == "table" and type(rawget(a, "name")) == "string"
+                    and (type(rawget(a, "id")) == "number" or type(k1) == "number") then
+                    local added = 0
+                    for k, it in next, v do
+                        if type(it) == "table" and type(rawget(it, "name")) == "string" then
+                            local id = rawget(it, "id")
+                            if type(id) ~= "number" then id = (type(k) == "number") and k or nil end
+                            if id and (ItemDB[id] == nil or (rawget(ItemDB[id], "kind") == nil and rawget(it, "kind") ~= nil)) then
+                                ItemDB[id] = it
+                                added = added + 1
+                            end
+                        end
+                    end
+                    if added > 0 then
+                        nItemTabs = nItemTabs + 1
+                        nItems = nItems + added
+                    end
+                end
+            end)
+        end
+    end
+end
+
+local function debugTA()
+    local L = {}
+    local function short(s, n)
+        s = tostring(s)
+        if #s > n then return string.sub(s, 1, n) .. "~" end
+        return s
+    end
+    local function add(x) L[#L + 1] = short(x, 420) end
+    local w = World
+    local st = 0
+    pcall(function() st = workspace:GetServerTimeNow() end)
+    local function fnInfo(fn)
+        local src, line, name, np = "?", "?", "?", "?"
+        pcall(function() src = debug.info(fn, "s") end)
+        pcall(function() line = debug.info(fn, "l") end)
+        pcall(function() name = debug.info(fn, "n") end)
+        pcall(function() np = debug.info(fn, "a") end)
+        src = tostring(src)
+        if #src > 28 then src = "~" .. string.sub(src, -28) end
+        return ("%s:%s '%s' param=%s"):format(src, tostring(line), tostring(name), tostring(np))
+    end
+    local function strConsts(fn, max)
+        if not getconsts then return "(getconsts tidak ada)" end
+        local ok, consts = pcall(getconsts, fn)
+        if not ok or type(consts) ~= "table" then return "(gagal baca konstanta)" end
+        local out, n = {}, 0
+        for _, c in pairs(consts) do
+            if type(c) == "string" and #c > 0 then
+                n = n + 1
+                if n <= max then out[#out + 1] = short(c, 22) end
+            end
+        end
+        return table.concat(out, ",") .. (n > max and (" ...+" .. (n - max)) or "")
+    end
+    local function valInfo(v)
+        if type(v) == "table" then return "{" .. keysOf(v, 8) .. "}" end
+        return type(v) .. "=" .. short(v, 18)
+    end
+    local function tblInfo(t)
+        local n, k1, v1 = 0, nil, nil
+        pcall(function()
+            for k, v in next, t do
+                n = n + 1
+                if n == 1 then k1, v1 = k, v end
+                if n >= 3000 then break end
+            end
+        end)
+        local mt = false
+        pcall(function() mt = getmetatable(t) ~= nil end)
+        return ("isi=%s%d kunci1=%s(%s) nilai1=%s meta=%s"):format(
+            n >= 3000 and ">=" or "", n, short(k1, 14), type(k1), valInfo(v1), tostring(mt))
+    end
+    -- daftar upvalue berurutan: { { i = nomor, v = nilai }, ... }, jumlah
+    local function upList(fn, max)
+        local ups = {}
+        pcall(function() ups = getUpvalues(fn) end)
+        local keys = {}
+        for i in pairs(ups) do
+            if type(i) == "number" then keys[#keys + 1] = i end
+        end
+        table.sort(keys)
+        local out = {}
+        for n, i in ipairs(keys) do
+            if n > max then break end
+            out[#out + 1] = { i = i, v = ups[i] }
+        end
+        return out, #keys
+    end
+
+    add("== SkyP Debug Pohon & Animasi ==")
+    local exName = "?"
+    if identifyexecutor then
+        local okE, n, v = pcall(identifyexecutor)
+        if okE then exName = tostring(n) .. (v and (" " .. tostring(v)) or "") end
+    end
+    add("Executor : " .. exName .. " | PlaceVersion " .. tostring(game.PlaceVersion))
+    add(("Fungsi   : getgc=%s getconsts=%s getconnections=%s getupvalues=%s getupvalue=%s setupvalue=%s islclosure=%s isexecutorclosure=%s"):format(
+        tostring(getgc ~= nil), tostring(getconsts ~= nil), tostring(getconnections ~= nil),
+        tostring(debug ~= nil and debug.getupvalues ~= nil),
+        tostring((debug ~= nil and debug.getupvalue ~= nil) or getupvalue ~= nil),
+        tostring((debug ~= nil and debug.setupvalue ~= nil) or setupvalue ~= nil),
+        tostring(islclosure ~= nil), tostring(isexecutorclosure ~= nil)))
+    add(("Data dasar: World=%s | ItemDB=%d item dari %d tabel"):format(w and "ketemu" or "TIDAK", nItems, nItemTabs))
+    add("Waktu server: " .. tostring(math.floor(st)))
+
+    ---------------- POHON ----------------
+    add("")
+    add("---- POHON ----")
+    local samples, nSeed, nSeedName = {}, 0, 0
+    if not w then
+        add("World belum ketemu di memori. Masuk ke world dulu, lalu jalankan lagi")
+    else
+        add(("World %sx%s"):format(tostring(w.w), tostring(w.h)))
+        -- pohon yang ada di world sekarang (tile fg berisi seed)
+        pcall(function()
+            for y = 0, w.h - 1 do
+                local row = w.fg[y]
+                if row then
+                    for x = 0, w.w - 1 do
+                        local id = row[x] or 0
+                        if id ~= 0 then
+                            local it = ItemDB[id]
+                            local byKind = it ~= nil and it.kind == "seed"
+                            local byName = it ~= nil and type(it.name) == "string" and string.find(string.lower(it.name), "seed") ~= nil
+                            if byKind then nSeed = nSeed + 1 end
+                            if byName and not byKind then nSeedName = nSeedName + 1 end
+                            if (byKind or byName) and #samples < 3 then
+                                samples[#samples + 1] = { x = x, y = y, idx = y * w.w + x, id = id }
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+        add(("Pohon di world: %d (kind=seed) | %d (hanya nama mengandung 'seed')"):format(nSeed, nSeedName))
+        for i, s in ipairs(samples) do
+            local it = ItemDB[s.id]
+            add(("  contoh %d: (%d,%d) idx=%d id=%d item={%s}"):format(i, s.x, s.y, s.idx, s.id,
+                it and keysOf(it, 14) or "tidak ada di ItemDB"))
+        end
+        if #samples == 0 then
+            add("  ! Tidak ada pohon di world ini. Tanam minimal 2 seed dulu, lalu jalankan debug lagi (supaya datanya bisa dilacak)")
+        end
+
+        -- isi World: fungsi & tabel
+        local fnNames, tbNames = {}, {}
+        pcall(function()
+            for k, v in next, w do
+                if type(v) == "function" then
+                    fnNames[#fnNames + 1] = tostring(k)
+                elseif type(v) == "table" then
+                    tbNames[#tbNames + 1] = tostring(k)
+                end
+            end
+        end)
+        table.sort(fnNames)
+        table.sort(tbNames)
+        add(("Fungsi World (%d): %s"):format(#fnNames, table.concat(fnNames, ",")))
+        add(("Tabel World (%d):"):format(#tbNames))
+        for i, k in ipairs(tbNames) do
+            if i > 30 then
+                add("  ...")
+                break
+            end
+            local v = rawget(w, k)
+            if k == "fg" or k == "bg" then
+                add("  " .. k .. ": (grid tile)")
+            elseif type(v) == "table" then
+                add("  " .. k .. ": " .. tblInfo(v))
+            end
+        end
+
+        -- fungsi akar yang dipakai pencari pohon SkyP + fungsi World yang namanya berbau pohon
+        local roots, seenRoot = {}, {}
+        for _, name in ipairs({ "tileChanged", "treeChanged", "setTree" }) do
+            roots[#roots + 1] = name
+            seenRoot[name] = true
+        end
+        for _, name in ipairs(fnNames) do
+            local low = string.lower(name)
+            if not seenRoot[name] and (string.find(low, "tree") or string.find(low, "plant") or string.find(low, "seed")
+                or string.find(low, "grow") or string.find(low, "harvest") or string.find(low, "splice")) then
+                roots[#roots + 1] = name
+                seenRoot[name] = true
+            end
+        end
+        for ri, name in ipairs(roots) do
+            if ri > 8 then
+                add("(akar lain dilewati)")
+                break
+            end
+            local f = rawget(w, name)
+            if type(f) ~= "function" then
+                add(("Akar World.%s: TIDAK ADA (%s)"):format(name, type(f)))
+            else
+                local ups, nUp = upList(f, 24)
+                add(("Akar World.%s: %s | upvalue %d | konst: %s"):format(name, fnInfo(f), nUp, strConsts(f, 18)))
+                local tset = {}
+                for _, e in ipairs(ups) do
+                    if type(e.v) == "table" and not rawequal(e.v, w) then tset[e.v] = true end
+                end
+                for _, e in ipairs(ups) do
+                    local v = e.v
+                    if rawequal(v, w) then
+                        add(("  up%d: = World"):format(e.i))
+                    elseif type(v) == "table" then
+                        add(("  up%d: tabel %s"):format(e.i, tblInfo(v)))
+                    elseif type(v) == "function" then
+                        local gu2 = {}
+                        pcall(function() gu2 = getUpvalues(v) end)
+                        local hasW, nT, nShared, nAll = false, 0, 0, 0
+                        for _, x in pairs(gu2) do
+                            nAll = nAll + 1
+                            if rawequal(x, w) then
+                                hasW = true
+                            elseif type(x) == "table" then
+                                nT = nT + 1
+                                if tset[x] then nShared = nShared + 1 end
+                            end
+                        end
+                        add(("  up%d: fungsi %s | up=%d World=%s tabel=%d sama=%d | konst: %s"):format(e.i, fnInfo(v),
+                            nAll, tostring(hasW), nT, nShared, strConsts(v, 12)))
+                    else
+                        add(("  up%d: %s=%s"):format(e.i, type(v), short(v, 20)))
+                    end
+                end
+            end
+        end
+        add(("Remote world: TreeChanged=%s"):format(tostring(WorldRemotes:FindFirstChild("TreeChanged") ~= nil)))
+    end
+
+    ---------------- SCAN MEMORI (pohon + animasi sekaligus) ----------------
+    local treeCands, armCands, nArm = {}, {}, 0
+    local nTab, nFn = 0, 0
+    add("")
+    if not gc then
+        add(tostring(gcErr or "scan memori tidak jalan"))
+    else
+        local need = math.min(2, #samples)
+        local fg, bg = w and rawget(w, "fg"), w and rawget(w, "bg")
+        local function timeLike(e)
+            return type(e) == "number" and math.abs(e - st) < 86400 * 90
+        end
+        for i, v in ipairs(gc) do
+            if i % 1500 == 0 then task.wait() end
+            local tv = type(v)
+            if tv == "table" then
+                nTab = nTab + 1
+                if need > 0 and #treeCands < 8 and not rawequal(v, w) and not rawequal(v, fg) and not rawequal(v, bg)
+                    and not rawequal(v, L) and not rawequal(v, samples) and not rawequal(v, gc) and not rawequal(v, ItemDB) then
+                    pcall(function()
+                        local hitIdx, hitXy, hitRows, entry = 0, 0, 0, nil
+                        for _, s in ipairs(samples) do
+                            local e = rawget(v, s.idx)
+                            if type(e) == "table" or timeLike(e) then
+                                hitIdx = hitIdx + 1
+                                entry = entry or e
+                            end
+                            local e2 = rawget(v, s.x .. "," .. s.y)
+                            if e2 ~= nil then
+                                hitXy = hitXy + 1
+                                entry = entry or e2
+                            end
+                            local r = rawget(v, s.y)
+                            if type(r) == "table" then
+                                local e3 = rawget(r, s.x)
+                                if type(e3) == "table" or timeLike(e3) then
+                                    hitRows = hitRows + 1
+                                    entry = entry or e3
+                                end
+                            end
+                        end
+                        local form = (hitIdx >= need and "idx") or (hitXy >= need and "xy") or (hitRows >= need and "rows") or nil
+                        if form then
+                            treeCands[#treeCands + 1] = { t = v, form = form, entry = entry }
+                        end
+                    end)
+                end
+            elseif tv == "function" then
+                nFn = nFn + 1
+                if getconsts then
+                    pcall(function()
+                        if islclosure and not islclosure(v) then return end
+                        if isexecutorclosure and isexecutorclosure(v) then return end
+                        local consts = getconsts(v)
+                        if type(consts) ~= "table" then return end
+                        local a, b, c, fuzzy, mine = false, false, false, false, false
+                        for _, k in pairs(consts) do
+                            if type(k) == "string" then
+                                if k == "SKYP_DBG_MARK" then mine = true -- fungsi debug ini sendiri
+                                elseif k == "forearm" then a = true
+                                elseif k == "heldReach" then b = true
+                                elseif k == "punchReach" then c = true
+                                else
+                                    local low = string.lower(k)
+                                    if string.find(low, "forearm", 1, true) or string.find(low, "heldreach", 1, true)
+                                        or string.find(low, "punchreach", 1, true) then
+                                        fuzzy = true
+                                    end
+                                end
+                            end
+                        end
+                        if (a or b or c or fuzzy) and not mine then
+                            nArm = nArm + 1
+                            if #armCands < 10 then
+                                armCands[#armCands + 1] = { fn = v, a = a, b = b, c = c, fuzzy = fuzzy }
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+        add(("Scan memori: %d objek (%d tabel, %d fungsi)"):format(#gc, nTab, nFn))
+    end
+
+    add("Tabel yang berisi data di posisi pohon contoh: " .. #treeCands)
+    for i, c in ipairs(treeCands) do
+        add(("  T%d bentuk=%s | %s"):format(i, c.form, tblInfo(c.t)))
+        add("      isi di pohon contoh: " .. valInfo(c.entry))
+    end
+
+    ---------------- ANIMASI ----------------
+    add("")
+    add("---- ANIMASI ----")
+    add(("Fungsi game yang menyebut forearm / heldReach / punchReach: %d"):format(nArm))
+    local armSet = {}
+    for i, c in ipairs(armCands) do
+        armSet[c.fn] = i
+        local full = c.a and c.b and c.c
+        add(("  A%d %s forearm=%s heldReach=%s punchReach=%s mirip=%s | %s"):format(i, full and "[COCOK]" or "[sebagian]",
+            tostring(c.a), tostring(c.b), tostring(c.c), tostring(c.fuzzy), fnInfo(c.fn)))
+        add("      konst: " .. strConsts(c.fn, 40))
+        local ups, nUp = upList(c.fn, 16)
+        local parts = {}
+        for _, e in ipairs(ups) do
+            local v = e.v
+            local d = type(v)
+            if d == "table" then
+                d = "{" .. keysOf(v, 5) .. "}"
+            elseif d ~= "function" and d ~= "nil" then
+                d = d .. "=" .. short(v, 12)
+            end
+            parts[#parts + 1] = e.i .. ":" .. d
+        end
+        -- sama dengan pencari SkyP: upvalue kosong / tabel {t, facing} sebelum upvalue terakhir yang terisi
+        local bindIdx, lastI = nil, 0
+        local gu = (debug and debug.getupvalue) or getupvalue
+        if gu then
+            local vals = {}
+            for k = 1, 16 do
+                local ok, v = pcall(gu, c.fn, k)
+                if not ok then break end
+                vals[k] = v
+                if v ~= nil then lastI = k end
+            end
+            for k = 1, lastI - 1 do
+                local v = vals[k]
+                if v == nil or (type(v) == "table" and rawget(v, "t") ~= nil and rawget(v, "facing") ~= nil) then
+                    bindIdx = k
+                    break
+                end
+            end
+        end
+        add(("      upvalue %d (terakhir terisi %d) | bind=%s | %s"):format(nUp, lastI, tostring(bindIdx), table.concat(parts, " ")))
+    end
+    if nArm == 0 then
+        add("  ! Tidak ada fungsi yang cocok: nama di kode game berubah, atau getconsts tidak bisa membaca fungsi game")
+    end
+
+    -- jalur dari loop game (RenderStepped dll) ke fungsi tangan (pencari SkyP hanya melihat kedalaman 1)
+    if not getconnections then
+        add("getconnections tidak ada: pencari animasi SkyP tidak bisa jalan di executor ini")
+    else
+        for _, name in ipairs({ "RenderStepped", "Heartbeat", "PreRender", "Stepped" }) do
+            local okS, sig = pcall(function() return RunService[name] end)
+            local nConn, nFnc, found = 0, 0, nil
+            if okS and sig then
+                local ok, conns = pcall(getconnections, sig)
+                if ok and type(conns) == "table" then
+                    local queue, depth, seen = {}, {}, {}
+                    for _, cn in ipairs(conns) do
+                        nConn = nConn + 1
+                        local okf, fn = pcall(function() return cn.Function end)
+                        if okf and type(fn) == "function" and not seen[fn] then
+                            nFnc = nFnc + 1
+                            seen[fn] = true
+                            queue[#queue + 1] = fn
+                            depth[fn] = 0
+                        end
+                    end
+                    local qi = 1
+                    while qi <= #queue and qi <= 2500 and not found do
+                        local fn = queue[qi]
+                        qi = qi + 1
+                        if qi % 400 == 0 then task.wait() end
+                        if armSet[fn] then
+                            found = ("A%d di kedalaman %d"):format(armSet[fn], depth[fn])
+                        elseif depth[fn] < 5 then
+                            local ups = {}
+                            pcall(function() ups = getUpvalues(fn) end)
+                            for _, u in pairs(ups) do
+                                if type(u) == "function" and not seen[u] then
+                                    seen[u] = true
+                                    depth[u] = depth[fn] + 1
+                                    queue[#queue + 1] = u
+                                end
+                            end
+                        end
+                    end
+                else
+                    add(("  %s: getconnections gagal (%s)"):format(name, tostring(conns)))
+                end
+            end
+            add(("  %s: %d koneksi, %d fungsi terbaca | fungsi tangan: %s"):format(name, nConn, nFnc,
+                found or "tidak terjangkau (sampai kedalaman 5)"))
+        end
+    end
+    return table.concat(L, "\n")
+end
+
+say("Memindai... (beberapa detik, layar bisa tersendat)")
+local okB, errB = pcall(findBase)
+local ok, res = pcall(debugTA)
+local text = ok and res or ("Debug error: " .. tostring(res))
+if not okB then text = "findBase error: " .. tostring(errB) .. "\n" .. text end
+local saved = type(writefile) == "function" and pcall(writefile, "SkyP_debug.txt", text)
+local clip = setclipboard or toclipboard
+local copied = clip ~= nil and pcall(clip, text)
+print(text)
+say("Selesai (" .. #text .. " huruf)" .. (copied and ", sudah disalin" or ", tidak bisa disalin otomatis")
+    .. (saved and ", tersimpan di SkyP_debug.txt" or ""))
