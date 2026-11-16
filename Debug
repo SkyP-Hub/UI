@@ -110,7 +110,8 @@ local function findBase()
         local okG, list = pcall(getgc, true)
         if okG and type(list) == "table" then
             seen[list] = true
-            for _, v in ipairs(list) do
+            for gi = 1, #list do -- bukan ipairs: daftar getgc bisa bolong
+                local v = list[gi]
                 local tv = type(v)
                 if tv == "table" or (tv == "function" and not isMine(v)) then
                     nGc = nGc + 1
@@ -250,6 +251,27 @@ local function debugTA()
         if type(v) == "table" then return "{" .. keysOf(v, 8) .. "}" end
         return type(v) .. "=" .. short(v, 18)
     end
+    -- isi 1 nilai sampai 2 tingkat (sub-tabel ikut dibuka)
+    local function deepInfo(v)
+        if type(v) ~= "table" then return type(v) .. "=" .. short(v, 18) end
+        local out, n = {}, 0
+        pcall(function()
+            for k, x in next, v do
+                n = n + 1
+                if n <= 16 then
+                    local tx = type(x)
+                    if tx == "table" then
+                        out[#out + 1] = tostring(k) .. ":{" .. keysOf(x, 8) .. "}"
+                    elseif tx == "number" or tx == "boolean" or tx == "string" then
+                        out[#out + 1] = tostring(k) .. "=" .. short(x, 16)
+                    else
+                        out[#out + 1] = tostring(k) .. ":" .. tx
+                    end
+                end
+            end
+        end)
+        return "{" .. table.concat(out, ", ") .. (n > 16 and (" ...+" .. (n - 16)) or "") .. "}"
+    end
     local function tblInfo(t)
         local n, k1, v1 = 0, nil, nil
         pcall(function()
@@ -281,7 +303,40 @@ local function debugTA()
         return out, #keys
     end
 
-    add("== SkyP Debug Pohon & Animasi ==")
+    -- Tabel bersama (kunci teks, ratusan isi = variabel modul game): cari anak tabel yang menyimpan data per tile
+    local sharedSeen, sampleRef = {}, nil
+    local function dumpShared(t, pad)
+        if sharedSeen[t] or type((next(t))) ~= "string" then return end
+        sharedSeen[t] = true
+        local numNames, nNum, nChild = {}, 0, 0
+        pcall(function()
+            for k, sub in next, t do
+                if type(sub) == "table" then
+                    nChild = nChild + 1
+                    local entry = nil
+                    for _, s in ipairs(sampleRef or {}) do
+                        entry = rawget(sub, s.idx)
+                        if entry == nil then entry = rawget(sub, s.x .. "," .. s.y) end
+                        if entry == nil then
+                            local r = rawget(sub, s.y)
+                            if type(r) == "table" then entry = rawget(r, s.x) end
+                        end
+                        if entry ~= nil then break end
+                    end
+                    if entry ~= nil then
+                        add(("%s.%s: ADA DATA DI POSISI POHON | %s"):format(pad, tostring(k), tblInfo(sub)))
+                        add(("%s    isi: %s"):format(pad, deepInfo(entry)))
+                    elseif type((next(sub))) == "number" then
+                        nNum = nNum + 1
+                        if #numNames < 40 then numNames[#numNames + 1] = tostring(k) end
+                    end
+                end
+            end
+        end)
+        add(("%s(tabel bersama: %d anak tabel, %d berkunci angka: %s)"):format(pad, nChild, nNum, table.concat(numNames, ",")))
+    end
+
+    add("== SkyP Debug Pohon & Animasi v3 ==")
     local exName = "?"
     if identifyexecutor then
         local okE, n, v = pcall(identifyexecutor)
@@ -377,6 +432,7 @@ local function debugTA()
                 seenRoot[name] = true
             end
         end
+        sampleRef = samples
         for ri, name in ipairs(roots) do
             if ri > 8 then
                 add("(akar lain dilewati)")
@@ -398,6 +454,11 @@ local function debugTA()
                         add(("  up%d: = World"):format(e.i))
                     elseif type(v) == "table" then
                         add(("  up%d: tabel %s"):format(e.i, tblInfo(v)))
+                        if type((next(v))) == "number" then
+                            local _, e1 = next(v)
+                            add("      isi pertama: " .. deepInfo(e1))
+                        end
+                        dumpShared(v, "      ")
                     elseif type(v) == "function" then
                         local gu2 = {}
                         pcall(function() gu2 = getUpvalues(v) end)
@@ -509,7 +570,7 @@ local function debugTA()
     add("Tabel yang berisi data di posisi pohon contoh: " .. #treeCands)
     for i, c in ipairs(treeCands) do
         add(("  T%d bentuk=%s | %s"):format(i, c.form, tblInfo(c.t)))
-        add("      isi di pohon contoh: " .. valInfo(c.entry))
+        add("      isi di pohon contoh: " .. deepInfo(c.entry))
     end
 
     ---------------- ANIMASI ----------------
